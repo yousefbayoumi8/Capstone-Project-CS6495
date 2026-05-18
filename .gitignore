@@ -1,3 +1,5 @@
 /src/__pycache__/
 /prompt_injection_env/
 /models/
+/.gradio/
+SETUP.md

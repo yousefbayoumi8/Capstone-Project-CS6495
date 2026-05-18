@@ -61,7 +61,6 @@ def generate_response(model, tokenizer, system_prompt: str,
     full_messages += messages
     
     # Convert to token IDs using the model's chat template
-    # Each model has its own special format — apply_chat_template handles this
     inputs = tokenizer.apply_chat_template(
         full_messages,
         add_generation_prompt=True,
