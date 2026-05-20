@@ -12,20 +12,27 @@ Your laptop can access it via your Tailscale IP on the same port.
 """
 
 import argparse
+import gc
 import json
 import sys
+import threading
+import time
+import uuid
 from pathlib import Path
-from typing import List, Dict
+from threading import Thread
+from typing import List, Dict, Optional, Any
 
+import torch
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from transformers import TextIteratorStreamer
 
 # ── your existing modules ──────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).parent))
-from src.model_loader import load_model, generate_response
+from src.model_loader import load_model, generate_response, render_chat, MODELS
 from src.target_model import SYSTEM_PROMPT
 
 # ── app setup ─────────────────────────────────────────────────────────────────
@@ -36,6 +43,26 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 MODEL = None
 TOKENIZER = None
 MODEL_NAME = "qwen"
+
+# Serializes model swaps + generation. One GPU = one inference at a time anyway.
+_model_lock = threading.Lock()
+
+def _ensure_model(name: str):
+    """Swap to `name` if it isn't the currently loaded model. Caller holds _model_lock."""
+    global MODEL, TOKENIZER, MODEL_NAME
+    if name == MODEL_NAME and MODEL is not None:
+        return
+    if name not in MODELS:
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown model '{name}'. Available: {list(MODELS)}")
+    # Free current model from VRAM before loading the next one
+    MODEL = None
+    TOKENIZER = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    MODEL, TOKENIZER = load_model(name)
+    MODEL_NAME = name
 
 # ── request / response models ─────────────────────────────────────────────────
 class ChatRequest(BaseModel):
@@ -59,6 +86,131 @@ async def model_info():
 @app.get("/reset")
 async def reset():
     return {"status": "ok"}
+
+# ── OpenAI-compatible API (for Open WebUI, LibreChat, etc.) ───────────────────
+class OAIMessage(BaseModel):
+    role: str
+    content: Any
+
+class OAIChatRequest(BaseModel):
+    model: Optional[str] = None
+    messages: List[OAIMessage]
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    stream: Optional[bool] = False
+
+def _content_to_text(content: Any) -> str:
+    # OpenAI allows content to be a string OR a list of parts ({type, text})
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+            elif isinstance(p, str):
+                parts.append(p)
+        return "".join(parts)
+    return str(content)
+
+@app.get("/v1/models")
+async def list_models():
+    created = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {"id": name, "object": "model", "created": created, "owned_by": "local"}
+            for name in MODELS
+        ],
+    }
+
+def _build_streamer_inputs(system_prompt: str, convo: List[Dict[str, str]]):
+    full_messages = [{"role": "system", "content": system_prompt}] + convo
+    return render_chat(TOKENIZER, full_messages).to(MODEL.device)
+
+def _sse_stream(requested: str, system_prompt: str, convo: List[Dict[str, str]],
+                max_new: int, temperature: float):
+    """SSE generator. Acquires _model_lock for the whole stream."""
+    with _model_lock:
+        _ensure_model(requested)
+
+        inputs = _build_streamer_inputs(system_prompt, convo)
+        streamer = TextIteratorStreamer(
+            TOKENIZER, skip_prompt=True, skip_special_tokens=True
+        )
+        gen_kwargs = dict(
+            **inputs,
+            max_new_tokens=max_new,
+            do_sample=True,
+            temperature=temperature,
+            pad_token_id=TOKENIZER.eos_token_id,
+            streamer=streamer,
+        )
+        thread = Thread(target=MODEL.generate, kwargs=gen_kwargs)
+        thread.start()
+
+        chunk_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
+        created = int(time.time())
+
+        def chunk(delta: dict, finish: Optional[str] = None):
+            return "data: " + json.dumps({
+                "id": chunk_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": MODEL_NAME,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+            }) + "\n\n"
+
+        yield chunk({"role": "assistant"})
+        try:
+            for token in streamer:
+                if token:
+                    yield chunk({"content": token})
+        finally:
+            thread.join()
+        yield chunk({}, finish="stop")
+        yield "data: [DONE]\n\n"
+
+@app.post("/v1/chat/completions")
+async def chat_completions(req: OAIChatRequest):
+    # Pull out any system messages the client sent; merge with our SYSTEM_PROMPT
+    system_parts = [SYSTEM_PROMPT]
+    convo: List[Dict[str, str]] = []
+    for m in req.messages:
+        text = _content_to_text(m.content)
+        if m.role == "system":
+            system_parts.append(text)
+        else:
+            convo.append({"role": m.role, "content": text})
+
+    system_prompt = "\n\n".join(p for p in system_parts if p)
+    max_new = req.max_tokens or 512
+    temperature = req.temperature if req.temperature is not None else 0.7
+    requested = req.model or MODEL_NAME
+
+    if req.stream:
+        return StreamingResponse(
+            _sse_stream(requested, system_prompt, convo, max_new, temperature),
+            media_type="text/event-stream",
+        )
+
+    with _model_lock:
+        _ensure_model(requested)
+        reply = generate_response(MODEL, TOKENIZER, system_prompt, convo,
+                                  max_new_tokens=max_new, temperature=temperature)
+
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": MODEL_NAME,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": reply},
+            "finish_reason": "stop",
+        }],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
 
 # ── HTML frontend ─────────────────────────────────────────────────────────────
 HTML = """<!DOCTYPE html>

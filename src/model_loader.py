@@ -47,33 +47,61 @@ def load_model(model_name: str):
     return model, tokenizer
 
 
-def generate_response(model, tokenizer, system_prompt: str, 
-                      messages: list, max_new_tokens: int = 512):
+def render_chat(tokenizer, messages: list):
+    """
+    Apply the tokenizer's chat template. If the model's template doesn't
+    support a `system` role (e.g. Gemma), retry with the system content
+    merged into the first user message.
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+    except Exception as e:
+        if "system" not in str(e).lower():
+            raise
+        sys_text = "\n\n".join(
+            m["content"] for m in messages if m.get("role") == "system"
+        )
+        rest = [m for m in messages if m.get("role") != "system"]
+        if sys_text and rest and rest[0].get("role") == "user":
+            rest = [{"role": "user",
+                     "content": f"{sys_text}\n\n{rest[0]['content']}"}] + rest[1:]
+        elif sys_text:
+            rest = [{"role": "user", "content": sys_text}] + rest
+        return tokenizer.apply_chat_template(
+            rest,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+
+def generate_response(model, tokenizer, system_prompt: str,
+                      messages: list, max_new_tokens: int = 512,
+                      temperature: float = 0.7):
     """
     Generate a response given a system prompt and conversation history.
-    
+
     messages: list of dicts like [{"role": "user", "content": "hello"}]
     Returns: string response
     """
-    
+
     # Build full conversation
     full_messages = [{"role": "system", "content": system_prompt}]
     full_messages += messages
-    
-    # Convert to token IDs using the model's chat template
-    inputs = tokenizer.apply_chat_template(
-        full_messages,
-        add_generation_prompt=True,
-        return_tensors="pt",
-        return_dict=True,
-    ).to(model.device)
+
+    # Convert to token IDs using the model's chat template (with Gemma fallback)
+    inputs = render_chat(tokenizer, full_messages).to(model.device)
 
     with torch.no_grad():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.7,
+            temperature=temperature,
             pad_token_id=tokenizer.eos_token_id,
         )
 

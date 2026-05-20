@@ -2,4 +2,4 @@
 /prompt_injection_env/
 /models/
 /.gradio/
-SETUP.md
+*.md
