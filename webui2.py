@@ -43,6 +43,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"],
 MODEL = None
 TOKENIZER = None
 MODEL_NAME = "qwen"
+QUANTIZE = True  # set from CLI in main(); applies to startup AND hot-swaps
 
 # Serializes model swaps + generation. One GPU = one inference at a time anyway.
 _model_lock = threading.Lock()
@@ -61,7 +62,7 @@ def _ensure_model(name: str):
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    MODEL, TOKENIZER = load_model(name)
+    MODEL, TOKENIZER = load_model(name, quantize=QUANTIZE)
     MODEL_NAME = name
 
 # ── request / response models ─────────────────────────────────────────────────
@@ -905,19 +906,23 @@ async def index():
 
 # ── entry point ───────────────────────────────────────────────────────────────
 def main():
-    global MODEL, TOKENIZER, MODEL_NAME
+    global MODEL, TOKENIZER, MODEL_NAME, QUANTIZE
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="qwen",
                         choices=["qwen", "llama", "gemma"])
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--no-quantize", action="store_true",
+                        help="Load in FP16 instead of 4-bit. Needs ~16 GB VRAM.")
     args = parser.parse_args()
 
+    QUANTIZE = not args.no_quantize
     MODEL_NAME = args.model
-    MODEL, TOKENIZER = load_model(args.model)
+    MODEL, TOKENIZER = load_model(args.model, quantize=QUANTIZE)
 
-    print(f"\n✓ Model loaded: {args.model}")
+    precision = "4-bit" if QUANTIZE else "FP16"
+    print(f"\n✓ Model loaded: {args.model} ({precision})")
     print(f"✓ Interface: http://localhost:{args.port}\n")
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

@@ -1,5 +1,5 @@
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 # Model IDs on HuggingFace
 MODELS = {
@@ -8,42 +8,45 @@ MODELS = {
     "gemma": "google/gemma-2-9b-it"
 }
 
-def load_model(model_name: str):
+# NF4 4-bit quantization: ~75% VRAM reduction, ~2% quality drop.
+# Lets a 16 GB GPU comfortably hold any of the three 7-9B models plus KV cache.
+_BNB_4BIT = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_compute_dtype=torch.float16,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+)
+
+
+def load_model(model_name: str, quantize: bool = True):
     """
     Load a model and its tokenizer.
     model_name: one of 'llama', 'qwen', 'gemma'
+    quantize:   when True (default), load weights in 4-bit via bitsandbytes.
+                Set False to load in FP16 (needs ~16 GB VRAM for 7-9B models).
     """
-    
+
     if model_name not in MODELS:
         raise ValueError(f"Unknown model. Choose from: {list(MODELS.keys())}")
-    
+
     model_id = MODELS[model_name]
-    print(f"Loading {model_name} from {model_id}...")
+    precision = "4-bit (bitsandbytes)" if quantize else "FP16"
+    print(f"Loading {model_name} from {model_id} ({precision})...")
     print("This will download the model on first run (several GB).")
-    
-    # Tokenizer is the same for all three
+
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    
-    # Gemma needs special handling — slightly over 16GB at float16
-    # so we let it overflow to CPU RAM automatically
-    if model_name == "gemma":
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16,
-            device_map="auto"  # fills GPU first, overflows to CPU RAM
-        )
-    
-    # Llama and Qwen fit in 16GB at float16
+
+    load_kwargs = {"device_map": "auto"}
+    if quantize:
+        load_kwargs["quantization_config"] = _BNB_4BIT
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16,
-            device_map="auto"
-        )
-    
-    model.eval()  # set to evaluation mode — disables dropout etc
+        load_kwargs["torch_dtype"] = torch.float16
+
+    model = AutoModelForCausalLM.from_pretrained(model_id, **load_kwargs)
+
+    model.eval()  # disables dropout etc.
     print(f"{model_name} loaded successfully.")
-    
+
     return model, tokenizer
 
 
