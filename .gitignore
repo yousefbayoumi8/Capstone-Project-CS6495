@@ -3,3 +3,6 @@
 /models/
 /.gradio/
 *.md
+*/__pycache__/
+*/*/__pycache__/
+/eval/runs/
