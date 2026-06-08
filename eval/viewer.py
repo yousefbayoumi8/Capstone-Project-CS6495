@@ -56,6 +56,16 @@ def load_jsonl(p: Path) -> List[Dict]:
     return out
 
 
+LEGACY_SP_TO_DEFENSE = {"permissive": "none"}
+
+
+def _defense_id_of(record: dict) -> str:
+    if "defense_id" in record:
+        return record["defense_id"]
+    sp = record.get("system_prompt_id", "")
+    return LEGACY_SP_TO_DEFENSE.get(sp, sp)
+
+
 def load_run(name: str) -> Dict:
     run_dir = RUNS_DIR / name
     if not run_dir.is_dir():
@@ -64,15 +74,21 @@ def load_run(name: str) -> Dict:
     gens = load_jsonl(run_dir / "generations.jsonl")
     juds = load_jsonl(run_dir / "judgments.jsonl")
 
-    # Index judgments by (model, sp, dataset, behavior_id) → {judge: record}
+    # Normalize defense_id across legacy + new records.
+    for g in gens:
+        g["defense_id"] = _defense_id_of(g)
+    for j in juds:
+        j["defense_id"] = _defense_id_of(j)
+
+    # Index judgments by (model, defense, dataset, behavior_id) → {judge: record}
     jud_index: Dict[tuple, Dict[str, dict]] = {}
     for j in juds:
-        key = (j["model"], j["system_prompt_id"], j["dataset"], j["behavior_id"])
+        key = (j["model"], j["defense_id"], j["dataset"], j["behavior_id"])
         jud_index.setdefault(key, {})[j["judge"]] = j
 
     records = []
     for g in gens:
-        key = (g["model"], g["system_prompt_id"], g["dataset"], g["behavior_id"])
+        key = (g["model"], g["defense_id"], g["dataset"], g["behavior_id"])
         records.append({
             **g,
             "judgments": jud_index.get(key, {}),
@@ -80,7 +96,7 @@ def load_run(name: str) -> Dict:
 
     facets = {
         "models": sorted({g["model"] for g in gens}),
-        "system_prompts": sorted({g["system_prompt_id"] for g in gens}),
+        "defenses": sorted({g["defense_id"] for g in gens}),
         "datasets": sorted({g["dataset"] for g in gens}),
         "judges": sorted({j["judge"] for j in juds}),
         "labels": sorted({j["label"] for j in juds}),
@@ -185,8 +201,8 @@ HTML = r"""<!DOCTYPE html>
     <h3>Models</h3>
     <div class="pill-group" id="filter-models"></div>
 
-    <h3>System prompts</h3>
-    <div class="pill-group" id="filter-sps"></div>
+    <h3>Defenses</h3>
+    <div class="pill-group" id="filter-defenses"></div>
 
     <h3>Datasets</h3>
     <div class="pill-group" id="filter-ds"></div>
@@ -216,7 +232,7 @@ HTML = r"""<!DOCTYPE html>
 
 <script>
 let STATE = { run: null, records: [], facets: null, filters: {
-  models: new Set(), sps: new Set(), ds: new Set(), labels: new Set(), judge: null
+  models: new Set(), defenses: new Set(), ds: new Set(), labels: new Set(), judge: null
 }, search: "" };
 
 async function fetchJSON(u) { const r = await fetch(u); return r.json(); }
@@ -243,10 +259,10 @@ function setPills(elId, values, key, kind) {
 
 function updatePillStyles() {
   for (const [key, elId, kind] of [
-    ["models",  "filter-models", "on"],
-    ["sps",     "filter-sps",    "on"],
-    ["ds",      "filter-ds",     "on-purple"],
-    ["labels",  "filter-labels", "label"],
+    ["models",   "filter-models",   "on"],
+    ["defenses", "filter-defenses", "on"],
+    ["ds",       "filter-ds",       "on-purple"],
+    ["labels",   "filter-labels",   "label"],
   ]) {
     document.querySelectorAll(`#${elId} .pill`).forEach(p => {
       p.className = "pill";
@@ -271,7 +287,7 @@ function updatePillStyles() {
 function recordMatches(r) {
   const f = STATE.filters;
   if (f.models.size && !f.models.has(r.model)) return false;
-  if (f.sps.size && !f.sps.has(r.system_prompt_id)) return false;
+  if (f.defenses.size && !f.defenses.has(r.defense_id)) return false;
   if (f.ds.size && !f.ds.has(r.dataset)) return false;
   if (f.labels.size) {
     const labels = Object.values(r.judgments).map(j => j.label);
@@ -303,7 +319,7 @@ function renderRecord(r) {
     <div class="card-meta">
       <span>${r.model}</span>
       <span>·</span>
-      <span>${r.system_prompt_id}</span>
+      <span>${r.defense_id}</span>
       <span>·</span>
       <span>${r.dataset}/${r.behavior_id}</span>
       ${badges}
@@ -347,8 +363,8 @@ async function loadRun(name) {
   STATE.run = name;
   STATE.records = data.records;
   STATE.facets = data.facets;
-  setPills("filter-models", data.facets.models, "models");
-  setPills("filter-sps",    data.facets.system_prompts, "sps");
+  setPills("filter-models",   data.facets.models,   "models");
+  setPills("filter-defenses", data.facets.defenses, "defenses");
   setPills("filter-ds",     data.facets.datasets, "ds");
   setPills("filter-labels", data.facets.labels, "labels");
   setPills("filter-judges", data.facets.judges, "judge");

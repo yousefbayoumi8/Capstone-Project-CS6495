@@ -1,18 +1,18 @@
 """
 Phase 2 — judging.
 
-Reads generations.jsonl, scores each response with the chosen judge, and
-writes judgments.jsonl. Runs AFTER all target models are unloaded; the
-HarmBench classifier is the only thing in VRAM (~5 GB at 4-bit).
+Two ways to invoke:
+  --run <single_defense_dir>   judges just that one folder's generations.jsonl
+  --runs-dir <parent_dir>      finds every subfolder with generations.jsonl
+                               and judges each, loading the judge model ONCE
 
-Live monitoring:
-  - tqdm bar shows progress + ETA.
-  - `tail -f <run>/judgments.jsonl` for record-by-record live log.
-  - `tail -f <run>/judge.log` for the same lines that go to the console.
+Writes `judgments.jsonl` next to each `generations.jsonl`. Resumable —
+re-running skips records already judged by the same judge.
 
 Examples:
-    python -m eval.judge --run eval/runs/2026-05-28
-    python -m eval.judge --run eval/runs/2026-05-28 --judge substring
+    python -m eval.judge --runs-dir eval/runs
+    python -m eval.judge --run eval/runs/rules
+    python -m eval.judge --run eval/runs/none --judge substring
 """
 import argparse
 import json
@@ -20,7 +20,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, List, Set
 
 from tqdm import tqdm
 
@@ -28,8 +28,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from eval.judges import substring as substring_judge
 
 
+LEGACY_SP_TO_DEFENSE = {"permissive": "none"}
+
+
 def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _defense_id_of(record: Dict) -> str:
+    if "defense_id" in record:
+        return record["defense_id"]
+    sp = record.get("system_prompt_id", "")
+    return LEGACY_SP_TO_DEFENSE.get(sp, sp)
 
 
 def already_judged_keys(path: Path, judge_name: str) -> Set[tuple]:
@@ -41,7 +51,7 @@ def already_judged_keys(path: Path, judge_name: str) -> Set[tuple]:
             try:
                 r = json.loads(line)
                 if r.get("judge") == judge_name:
-                    keys.add((r["model"], r["system_prompt_id"], r["dataset"],
+                    keys.add((r["model"], _defense_id_of(r), r["dataset"],
                               r["behavior_id"]))
             except Exception:
                 continue
@@ -53,7 +63,7 @@ def write_judgment(out_f, gen: Dict, judge_name: str, verdict: Dict):
         "ts": iso_now(),
         "run_id": gen.get("run_id"),
         "model": gen["model"],
-        "system_prompt_id": gen["system_prompt_id"],
+        "defense_id": _defense_id_of(gen),
         "dataset": gen["dataset"],
         "behavior_id": gen["behavior_id"],
         "behavior_category": gen.get("behavior_category"),
@@ -81,10 +91,80 @@ class TeeLogger:
         self.f.close()
 
 
+def collect_pending(run_dir: Path, judge_name: str) -> List[Dict]:
+    """Read generations.jsonl from one folder; return list of pending generations
+    (not yet judged by judge_name, and not error records)."""
+    gen_path = run_dir / "generations.jsonl"
+    jud_path = run_dir / "judgments.jsonl"
+    if not gen_path.exists():
+        return []
+
+    done = already_judged_keys(jud_path, judge_name)
+    pending = []
+    with gen_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                g = json.loads(line)
+            except Exception:
+                continue
+            if "response" not in g:
+                continue
+            key = (g["model"], _defense_id_of(g), g["dataset"], g["behavior_id"])
+            if key in done:
+                continue
+            pending.append(g)
+    return pending
+
+
+def judge_folder(run_dir: Path, judge_name: str, judge_obj, logger: TeeLogger,
+                 quiet: bool, label_counts: Dict[str, int]):
+    """Judge one folder's pending generations. Writes to judgments.jsonl."""
+    pending = collect_pending(run_dir, judge_name)
+    if not pending:
+        logger.log(f"  {run_dir.name}: no pending records")
+        return
+
+    out_path = run_dir / "judgments.jsonl"
+    logger.log(f"  {run_dir.name}: {len(pending)} pending")
+
+    with out_path.open("a", encoding="utf-8") as out_f:
+        bar = tqdm(
+            pending,
+            desc=f"{run_dir.name}",
+            unit="rec",
+            smoothing=0.1,
+            disable=quiet,
+            ncols=110,
+        )
+        for gen in bar:
+            behavior = gen.get("raw_behavior") or gen["prompt"]
+            response = gen["response"]
+
+            if judge_name == "substring":
+                verdict = substring_judge.classify(behavior, response)
+            else:
+                try:
+                    verdict = judge_obj.classify(behavior, response)
+                except Exception as e:
+                    verdict = {"label": "error",
+                               "raw": f"{type(e).__name__}: {e}"}
+
+            label_counts[verdict["label"]] = label_counts.get(verdict["label"], 0) + 1
+            write_judgment(out_f, gen, judge_name, verdict)
+            bar.set_postfix_str(
+                " ".join(f"{k}={v}" for k, v in sorted(label_counts.items())),
+                refresh=False,
+            )
+        bar.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--run", required=True,
-                        help="Run directory (contains generations.jsonl).")
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--run", help="Single run directory (contains generations.jsonl).")
+    group.add_argument("--runs-dir", help="Parent directory; judges every subfolder "
+                                          "containing generations.jsonl, "
+                                          "loading the judge model once.")
     parser.add_argument("--judge", default="harmbench_cls",
                         choices=["harmbench_cls", "substring"])
     parser.add_argument("--no-quantize", action="store_true",
@@ -93,37 +173,22 @@ def main():
                         help="Hide the tqdm bar.")
     args = parser.parse_args()
 
-    run_dir = Path(args.run)
-    in_path = run_dir / "generations.jsonl"
-    out_path = run_dir / "judgments.jsonl"
-    log_path = run_dir / "judge.log"
+    # Resolve the list of folders to judge.
+    if args.run:
+        folders = [Path(args.run)]
+        log_path = folders[0] / "judge.log"
+    else:
+        parent = Path(args.runs_dir)
+        folders = [p for p in sorted(parent.iterdir())
+                   if p.is_dir() and (p / "generations.jsonl").exists()]
+        log_path = parent / "judge.log"
 
-    if not in_path.exists():
-        raise SystemExit(f"Missing {in_path}")
+    if not folders:
+        raise SystemExit("No folders with generations.jsonl found.")
 
     logger = TeeLogger(log_path)
-
-    logger.log(f"Run: {run_dir}")
     logger.log(f"Judge: {args.judge}")
-
-    done = already_judged_keys(out_path, args.judge)
-    if done:
-        logger.log(f"Resuming: {len(done)} records already judged by {args.judge}.")
-
-    gens = []
-    with in_path.open("r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                gens.append(json.loads(line))
-            except Exception:
-                continue
-    logger.log(f"Loaded {len(gens)} generations.")
-
-    pending = [g for g in gens
-               if (g["model"], g["system_prompt_id"], g["dataset"],
-                   g["behavior_id"]) not in done
-               and "response" in g]
-    logger.log(f"Pending judgments: {len(pending)}")
+    logger.log(f"Folders to judge: {[f.name for f in folders]}")
 
     judge_obj = None
     if args.judge == "harmbench_cls":
@@ -136,44 +201,15 @@ def main():
     label_counts: Dict[str, int] = {}
 
     try:
-        with out_path.open("a", encoding="utf-8") as out_f:
-            bar = tqdm(
-                pending,
-                desc=f"judging ({args.judge})",
-                unit="rec",
-                smoothing=0.1,
-                disable=args.quiet,
-                ncols=110,
-            )
-            for gen in bar:
-                behavior = gen.get("raw_behavior") or gen["prompt"]
-                response = gen["response"]
-
-                if args.judge == "substring":
-                    verdict = substring_judge.classify(behavior, response)
-                else:
-                    try:
-                        verdict = judge_obj.classify(behavior, response)
-                    except Exception as e:
-                        verdict = {"label": "error",
-                                   "raw": f"{type(e).__name__}: {e}"}
-
-                label_counts[verdict["label"]] = label_counts.get(verdict["label"], 0) + 1
-                write_judgment(out_f, gen, args.judge, verdict)
-
-                # rolling tally on the bar
-                bar.set_postfix_str(
-                    " ".join(f"{k}={v}" for k, v in sorted(label_counts.items())),
-                    refresh=False,
-                )
-            bar.close()
+        for folder in folders:
+            judge_folder(folder, args.judge, judge_obj, logger, args.quiet,
+                         label_counts)
     finally:
         if judge_obj is not None:
             judge_obj.unload()
         elapsed = int(time.perf_counter() - run_start)
         logger.log(f"Done in {elapsed//60}m {elapsed%60}s.")
         logger.log(f"Label tally: {label_counts}")
-        logger.log(f"Output: {out_path}")
         logger.close()
 
 
